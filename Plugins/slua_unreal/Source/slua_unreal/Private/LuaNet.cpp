@@ -63,7 +63,13 @@ namespace NS_SLUA
     ClassLuaReplicated* LuaNet::getClassReplicatedProps(const UObject* obj)
     {
         auto cls = obj->GetClass();
-        return classLuaReplicatedMap.Find(cls);
+        auto classLuaReplicatedPtr = classLuaReplicatedMap.Find(cls);
+        if (classLuaReplicatedPtr)
+        {
+            return *classLuaReplicatedPtr;
+        }
+
+        return nullptr;
     }
 
     void LuaNet::removeObjectTable(UObject* obj)
@@ -91,8 +97,10 @@ namespace NS_SLUA
 
     void LuaNet::onObjectDeleted(UClass* cls)
     {
-        if (classLuaReplicatedMap.Contains(cls))
+        auto classLuaReplicatedPtr = classLuaReplicatedMap.Find(cls);
+        if (classLuaReplicatedPtr)
         {
+            delete * classLuaReplicatedPtr;
             classLuaReplicatedMap.Remove(cls);
         }
     }
@@ -115,7 +123,7 @@ namespace NS_SLUA
             
             if (classReplicatedPtr)
             {
-                return classReplicatedPtr;
+                return *classReplicatedPtr;
             }
             else
             {
@@ -128,7 +136,8 @@ namespace NS_SLUA
                         auto luaReplicatedTable = getLifetimeFunc.call();
                         if (luaReplicatedTable.isTable())
                         {
-                            auto& classReplicated = classLuaReplicatedMap.Add(cls);
+                            auto classReplicatedPtr = classLuaReplicatedMap.Add(cls, new ClassLuaReplicated());
+                            auto& classReplicated = *classReplicatedPtr;
                             classReplicated.ownerProperty = prop;
                     
                             auto &replicatedNameToIndexMap = classReplicated.replicatedNameToIndexMap;
@@ -256,7 +265,7 @@ namespace NS_SLUA
 
     void LuaNet::initFlatReplicatedProps(ClassLuaReplicated& classReplicated,
                                          ReplicateOffsetToMarkType& markIndex, UStruct* ustruct,
-                                         int32& index, int32 offset, int32 ownerPropIndex, NS_SLUA::FlatArrayPropInfo* arrayInfo)
+                                         int32& index, const int32 offset, int32 ownerPropIndex, NS_SLUA::FlatArrayPropInfo* arrayInfo)
     {
         bool outMost = ustruct == classReplicated.ustruct;
 
@@ -317,6 +326,12 @@ namespace NS_SLUA
                 ownerPropIndex++;
             }
         }
+
+        int32 structEndOffset = offset + ustruct->GetPropertiesSize();
+        if (!markIndex.Contains(structEndOffset))
+        {
+            markIndex.Add(structEndOffset, index);
+        }
     }
 
     void LuaNet::initLuaReplicatedProps(slua::lua_State* L, UObject* obj, const ClassLuaReplicated& classReplicated,
@@ -355,13 +370,10 @@ namespace NS_SLUA
                 proxy.contentStruct = classReplicated.ustruct;
                 proxy.dirtyMark = LuaBitArray(classReplicated.properties.Num());
 
-                if (FLuaNetSerialization::SerializeVersion == 1)
+                proxy.flatDirtyMark = LuaBitArray(classReplicated.flatProperties.Num());
+                for (auto iter : classReplicated.flatArrayPropInfos)
                 {
-                    proxy.flatDirtyMark = LuaBitArray(classReplicated.flatProperties.Num());
-                    for (auto iter : classReplicated.flatArrayPropInfos)
-                    {
-                        proxy.arrayDirtyMark.Add(iter.Key, LuaBitArray(iter.Value.innerPropertyNum * ClassLuaReplicated::MaxArrayLimit));
-                    }
+                    proxy.arrayDirtyMark.Add(iter.Key, LuaBitArray(iter.Value.innerPropertyNum * ClassLuaReplicated::MaxArrayLimit));
                 }
                 
                 auto &content = proxy.values;
@@ -493,9 +505,6 @@ namespace NS_SLUA
 #endif
     }
 
-    // 实现IInstancedLuaInterface接口的对象getLuaFilePath时候bCDOLua需要用false参数
-    // 所以addClassRPCRecursive的luaFilePath参数从外部传入，复用bindOverrideFuncs已经获取到的luaFilePath
-    // 但是在该函数内部superCls的getLuaFilePath时候bCDOLua就可以是true，因为IInstancedLuaInterface只对最底层的子类有效
     bool LuaNet::addClassRPCRecursive(lua_State* L, UClass* cls, const FString& luaFilePath, LuaVar& cppSuperModule)
     {
         if (luaFilePath.IsEmpty()) { return false; }

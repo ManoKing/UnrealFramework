@@ -56,8 +56,6 @@ FAutoConsoleVariableRef CVarSluaEnableReference(
     TEXT("Whether enable struct reference."));
 
 namespace NS_SLUA {
-    static const FName NAME_LatentInfo = TEXT("LatentInfo");
-
     static const uint64 ReferenceCastFlags = FArrayProperty::StaticClassCastFlags()
         | FMapProperty::StaticClassCastFlags()
         | FSetProperty::StaticClassCastFlags();
@@ -98,7 +96,7 @@ namespace NS_SLUA {
         , size(0)
         , uss(nullptr)
         , proxy(nullptr)
-        , luaReplicatedIndex(0)
+        , luaReplicatedIndex(InvalidReplicatedIndex)
         , isRef(false)
     {
     }
@@ -522,10 +520,43 @@ namespace NS_SLUA {
     }
 
     LuaObject::ReferencePusherPropertyFunction LuaObject::getReferencePusher(FProperty* prop) {
-        auto sp = CastField<FStructProperty>(prop);
-        if (sp && sp->Struct == FLuaBPVar::StaticStruct())
-            return nullptr;
-        return getReferencePusher(prop->GetClass());        
+        auto cls = prop->GetClass();
+#if (ENGINE_MINOR_VERSION<25) && (ENGINE_MAJOR_VERSION==4)
+        constexpr auto StructCastFlag = CASTCLASS_UStructProperty;
+        constexpr auto ArrayCastFlag = CASTCLASS_UArrayProperty;
+
+        if (cls->HasAnyCastFlag(StructCastFlag | ArrayCastFlag)) {
+            if (cls->HasAnyCastFlag(StructCastFlag)) {
+                auto sp = static_cast<FStructProperty*>(prop);
+                if (sp && sp->Struct == FSluaBPVar::StaticStruct())
+                    return nullptr;
+            }
+            else {
+                auto arrayProp = static_cast<FArrayProperty*>(prop);
+                if (isBinStringProperty(arrayProp->Inner)) {
+                    return nullptr;
+                }
+            }
+        }
+#else
+        constexpr auto StructCastFlag = CASTCLASS_FStructProperty;
+        constexpr auto ArrayCastFlag = CASTCLASS_FArrayProperty;
+
+        if (cls->HasAnyCastFlags(StructCastFlag | ArrayCastFlag)) {
+            if (cls->HasAnyCastFlags(StructCastFlag)) {
+                auto sp = static_cast<FStructProperty*>(prop);
+                if (sp && sp->Struct == FLuaBPVar::StaticStruct())
+                    return nullptr;
+            }
+            else if (cls->HasAnyCastFlags(ArrayCastFlag)) {
+                auto arrayProp = static_cast<FArrayProperty*>(prop);
+                if (isBinStringProperty(arrayProp->Inner)) {
+                    return nullptr;
+                }
+            }
+        }
+#endif
+        return getReferencePusher(cls);
     }
 
     void regPusher(FFieldClass* cls,LuaObject::PushPropertyFunction func) {
@@ -675,25 +706,6 @@ namespace NS_SLUA {
         return 0;
     }
 
-    void* fillParamFromState(lua_State* L,FProperty* prop,uint8* params,int i) {
-
-        // if is out param, can accept nil
-        uint64 propflag = prop->GetPropertyFlags();
-        if((propflag&CPF_OutParm) && lua_isnil(L,i))
-            return nullptr;
-
-        auto checker = LuaObject::getChecker(prop);
-        if(checker) {
-            return checker(L,prop,params,i,false);
-        }
-        else {
-            FString tn = prop->GetClass()->GetName();
-            luaL_error(L,"unsupport param type %s at %d",TCHAR_TO_UTF8(*tn),i);
-            return nullptr;
-        }
-        
-    }
-
     int luaFunctionCall(lua_State* L, UObject* obj, UFunction* func, int paramOffset, int paramCount) {
         if (func->FunctionFlags & FUNC_Net) {
 #if (ENGINE_MINOR_VERSION<25) && (ENGINE_MAJOR_VERSION==4)
@@ -789,6 +801,41 @@ namespace NS_SLUA {
         return state->classMap.findProp(cls, pname);
     }
 
+    int getTableMember(lua_State* L, const LuaVar& table, int keyIndex)
+    {
+        ensure(keyIndex > 0);
+        
+        table.push(L);
+        lua_pushvalue(L, keyIndex);
+        int t = lua_rawget(L, -2);
+        if (t == LUA_TNIL)
+        {
+            lua_pop(L, 1);
+
+            int type = luaL_getmetafield(L, -1, "__index");
+            if (type == LUA_TFUNCTION)
+            {
+                // get metatable __index function's upvalue[0]
+#if LUA_VERSION_NUM > 503
+                TValue* v = s2v(L->top - 1);
+                CClosure* f = clCvalue(v);
+#else
+                CClosure* f = clCvalue(L->top - 1);
+#endif
+                setobj2s(L, L->top - 1, &f->upvalue[0]);
+
+                lua_pushvalue(L, -2); // push self table
+                lua_pushvalue(L, keyIndex); // push key
+                lua_call(L, 2, 1);
+                
+                t = lua_type(L, -1); // get return value type
+            }
+        }
+
+        lua_remove(L, -2);
+        return t;
+    }
+
     int luaFuncClosure(lua_State* L) {
         int argsCount = lua_gettop(L);
         lua_pushvalue(L, lua_upvalueindex(1));
@@ -801,6 +848,15 @@ namespace NS_SLUA {
         if (!table) {
             luaL_error(L, "arg 1 expect table, but got nil!");
         }
+
+        int retCountFix = 0;
+        if (lua_type(L, -1) == LUA_TSTRING) {
+            if (getTableMember(L, *table, argsCount + 1) != LUA_TFUNCTION) {
+                luaL_error(L, "can't find lua function %s", lua_tostring(L, -2));
+            }
+            retCountFix = 1;
+        }
+        
         table->push(L);
 
         for (int i = 2; i <= argsCount; ++i) {
@@ -808,7 +864,7 @@ namespace NS_SLUA {
         }
 
         lua_call(L, argsCount, LUA_MULTRET);
-        int retCount = lua_gettop(L) - argsCount;
+        int retCount = lua_gettop(L) - argsCount - retCountFix;
         return retCount;
     }
 
@@ -976,7 +1032,7 @@ namespace NS_SLUA {
         return 0;
     }
 
-    int tryGetTableMember(lua_State* L, UObject* obj)
+    int tryGetTableLuaFunc(lua_State* L, UObject* obj)
     {
         auto* objTable = ULuaOverrider::getObjectTable(obj, L);
         if (objTable)
@@ -986,57 +1042,24 @@ namespace NS_SLUA {
             {
                 return 0;
             }
-            table->push(L); // push self
-            lua_pushvalue(L, 2);
-            int type = lua_rawget(L, -2);
-            if (type != LUA_TNIL) 
+
+            int t = getTableMember(L, *table, 2);
+            if (t == LUA_TFUNCTION && !lua_iscfunction(L, -1))
             {
-                if (type == LUA_TFUNCTION && !lua_iscfunction(L, -1))
+                lua_pushvalue(L, 2); // push function name instead of lua function
+                lua_pushcclosure(L, luaFuncClosure, 1); // push luaFuncClosure with function name upvalue
+                if (!objTable->isInstance)
                 {
-                    lua_pushcclosure(L, luaFuncClosure, 1);
-                    if (!objTable->isInstance)
-                    {
-                        cacheFunction(L, nullptr);
-                    }
+                    cacheFunction(L, nullptr);
                 }
+            }
+
+            if (t != LUA_TNIL)
+            {
                 return 1;
             }
-            else
-            {
-                lua_pop(L, 1);
 
-                int t = luaL_getmetafield(L, -1, "__index");
-                if (t == LUA_TFUNCTION)
-                {
-                    // get metatable __index function's upvalue[0]
-#if LUA_VERSION_NUM > 503
-                    TValue* v = s2v(L->top -1);
-                    CClosure* f = clCvalue(v);
-#else
-                    CClosure* f = clCvalue(L->top - 1);
-#endif
-                    setobj2s(L, L->top - 1, &f->upvalue[0]);
-
-                    lua_pushvalue(L, -2); // push self table
-                    lua_pushvalue(L, 2); // push key
-                    lua_call(L, 2, 1);
-                    if (lua_type(L, -1) == LUA_TFUNCTION)
-                    {
-                        lua_pushcclosure(L, luaFuncClosure, 1);
-                        if (!objTable->isInstance)
-                        {
-                            cacheFunction(L, nullptr);
-                        }
-                        return 1;
-                    }
-                }
-                if (t != LUA_TNIL)
-                {
-                    lua_pop(L, 1);
-                }
-            }
-            // pop self table
-            lua_pop(L, 1);
+            lua_pop(L, 1); // pop nil value
         }
 
         return 0;
@@ -1061,7 +1084,7 @@ namespace NS_SLUA {
 
         auto* objTable = ULuaOverrider::getObjectTable(obj, L);
         if (objTable && objTable->table.getState() == L->l_G->mainthread) {
-            objTable->table.push(L); // push self
+            objTable->table.push(L); // push self table
             if (objTable->isInstance)
             {
                 lua_pushstring(L, LuaOverrider::INSTANCE_CACHE_NAME);
@@ -1081,9 +1104,9 @@ namespace NS_SLUA {
             int type = lua_gettable(L, -2);
             if (type != LUA_TNIL) {
                 if (type == LUA_TFUNCTION) {
-                    lua_pushcclosure(L, luaFuncClosure, 1);
                     if (objTable->isInstance)
                     {
+                        lua_pushcclosure(L, luaFuncClosure, 1);
                         // cache instance function in self.__instance_cache
                         lua_pushstring(L, LuaOverrider::INSTANCE_CACHE_NAME);
                         if (lua_rawget(L, -3) == LUA_TNIL)
@@ -1103,6 +1126,10 @@ namespace NS_SLUA {
                     }
                     else
                     {
+                        lua_pop(L, 1); // pop lua function
+                        lua_pushvalue(L, 2); // push function name instead of lua function
+                        lua_pushcclosure(L, luaFuncClosure, 1); // push luaFuncClosure with function name upvalue
+
                         cacheFunction(L, nullptr);
                     }
                 }
@@ -1226,7 +1253,7 @@ namespace NS_SLUA {
                         lua_pop(L, retCount);
                     }
                 }
-                else if (int res = tryGetTableMember(L, obj))
+                else if (int res = tryGetTableLuaFunc(L, obj))
                 {
                     return res;
                 }
@@ -1245,8 +1272,6 @@ namespace NS_SLUA {
             else
                 return false;
         }
-        if (up->GetPropertyFlags() & CPF_BlueprintReadOnly)
-            luaL_error(L, "Property %s is readonly", name);
 
         auto checker = LuaObject::getChecker(up);
         if (!checker) luaL_error(L, "Property %s type is not support", name);
@@ -1325,8 +1350,17 @@ namespace NS_SLUA {
             return 1;
         }
 
+        lua_pop(L, 1); // pop previous key to compatible with LuaObject::pushReferenceAndCache method
+
         FString key = up->GetName();
         lua_pushstring(L, TCHAR_TO_UTF8(*key));
+
+        if (int res = LuaObject::fastIndex(L, (uint8*)obj, obj->GetClass()))
+        {
+            lua_pushvalue(L, 2);
+            lua_pushvalue(L, -2);
+            return res + 1;
+        }
 
         return LuaObject::push(L, up, obj, nullptr) + 1;
     }
@@ -1401,8 +1435,6 @@ namespace NS_SLUA {
         auto* cls = ls->uss;
         FProperty* up = LuaObject::findCacheProperty(L, cls, name);
         if (!up) luaL_error(L, "Can't find property named %s", name);
-        if (up->GetPropertyFlags() & CPF_BlueprintReadOnly)
-            luaL_error(L, "Property %s is readonly", name);
 
         auto checker = LuaObject::getChecker(up);
         if(!checker) luaL_error(L,"Property %s type is not support",name);
@@ -1474,8 +1506,17 @@ namespace NS_SLUA {
             return 1;
         }
 
+        lua_pop(L, 1); // pop previous key to compatible with LuaObject::pushReferenceAndCache method
+
         FString key = getPropertyFriendlyName(up);
         lua_pushstring(L, TCHAR_TO_UTF8(*key));
+
+        if (int res = LuaObject::fastIndex(L, ls->buf, ls->uss))
+        {
+            lua_pushvalue(L, 2);
+            lua_pushvalue(L, -2);
+            return res + 1;
+        }
 
         return LuaObject::push(L, up, ls->buf + up->GetOffset_ForInternal(), nullptr) + 1;
     }
@@ -1674,7 +1715,7 @@ namespace NS_SLUA {
         }
 
         auto scriptArray = (FScriptArray*)parms;
-        if (type == LUA_TSTRING && p->Inner->GetClass() == FByteProperty::StaticClass()) {
+        if (type == LUA_TSTRING && LuaObject::isBinStringProperty(p->Inner)) {
             size_t len;
             uint8* content = (uint8*)lua_tolstring(L, i, &len);
 #if ENGINE_MAJOR_VERSION==5
@@ -2506,7 +2547,7 @@ namespace NS_SLUA {
             FString name;
             // if is bp enum, can't get name as key
             if(isbpEnum)
-                name = e->GetDisplayNameTextByIndex(i).ToString();
+                name = *FTextInspector::GetSourceString(e->GetDisplayNameTextByIndex(i));
             else
                 name = e->GetNameStringByIndex(i);
             int64 value = e->GetValueByIndex(i);
@@ -2559,7 +2600,7 @@ namespace NS_SLUA {
             unlinkProp(L, userdata);
         }
 
-        if (DeferGCStruct)
+        if (DeferGCStruct && !ls->isRef)
         {
             LuaState* luaState = LuaState::get(L);
             luaState->deferGCStruct.Add(ls);

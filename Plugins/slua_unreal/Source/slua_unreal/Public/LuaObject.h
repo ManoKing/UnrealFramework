@@ -396,6 +396,17 @@ namespace NS_SLUA {
 #endif
         }
 
+        static inline bool isBinStringProperty(FProperty* inner)
+        {
+            if (inner->GetClass() == FByteProperty::StaticClass())
+            {
+                auto byteProperty = CastField<FByteProperty>(inner);
+                return byteProperty->Enum == nullptr;
+            }
+
+            return false;
+        }
+
         // create new enum type to lua, see DefEnum macro
         template<class T>
         static void newEnum(lua_State* L, const char* tn, const char* keys, std::initializer_list<T> values) {
@@ -589,6 +600,8 @@ namespace NS_SLUA {
 
         template<class T>
         static typename std::enable_if< std::is_pointer<T>::value,T >::type checkReturn(lua_State* L, int p) {
+            typedef typename std::remove_pointer<T>::type NonPointerType;
+
             UserData<T> *udptr = reinterpret_cast<UserData<T>*>(lua_touserdata(L, p));
             if (udptr->flag & UD_HADFREE)
                 luaL_error(L, "checkValue error, obj parent has been freed");
@@ -597,10 +610,25 @@ namespace NS_SLUA {
                 UserData<LuaStruct*> *structptr = reinterpret_cast<UserData<LuaStruct*>*>(udptr);
                 LuaStruct* ls = structptr->ud;
                 // skip first prefix like 'F','U','A'
-                if (sizeof(typename std::remove_pointer<T>::type) == ls->size && strcmp(TypeName<T>::value().c_str()+1, TCHAR_TO_UTF8(*ls->uss->GetName())) == 0)
+                if (sizeof(NonPointerType) == ls->size && strcmp(TypeName<T>::value().c_str()+1, TCHAR_TO_UTF8(*ls->uss->GetName())) == 0)
                     return (T)(ls->buf);
                 else
-                    luaL_error(L, "checkValue error, type dismatched, expect %s", TypeName<T>::value().c_str());
+                    luaL_error(L, "checkValue error, type mismatched, expect %s, but got %s", TypeName<T>::value().c_str(), TCHAR_TO_UTF8(*ls->uss->GetName()));
+            }
+            else if (udptr->flag & UD_VALUETYPE) {
+                if (luaL_getmetafield(L, p, "__name") == LUA_TSTRING)
+                {
+                    const char* valueTypeName = lua_tostring(L, -1);
+                    if (strcmp(TypeName<NonPointerType>::value().c_str(), valueTypeName) == 0)
+                    {
+                        lua_pop(L, 1);
+                        return udptr->ud;
+                    }
+
+                    luaL_error(L, "checkValue error, type mismatched, expect %s, but got %s", TypeName<NonPointerType>::value().c_str(), valueTypeName);
+                }
+
+                luaL_error(L, "checkValue error, type mismatched, expect %s, but got %s", TypeName<NonPointerType>::value().c_str(), "unknown");
             }
             return udptr->ud;
         }
@@ -619,7 +647,22 @@ namespace NS_SLUA {
                 if (sizeof(T) == ls->size && strcmp(TypeName<T>::value().c_str() + 1, TCHAR_TO_UTF8(*ls->uss->GetName())) == 0)
                     return *((T*)(ls->buf));
                 else
-                    luaL_error(L, "checkValue error, type dismatched, expect %s", TypeName<T>::value().c_str());
+                    luaL_error(L, "checkValue error, type mismatched, expect %s, but got %s", TypeName<T>::value().c_str(), TCHAR_TO_UTF8(*ls->uss->GetName()));
+            }
+            else if (udptr->flag & UD_VALUETYPE) {
+                if (luaL_getmetafield(L, p, "__name") == LUA_TSTRING)
+                {
+                    const char* valueTypeName = lua_tostring(L, -1);
+                    if (strcmp(TypeName<T>::value().c_str(), valueTypeName) == 0)
+                    {
+                        lua_pop(L, 1);
+                        return *(udptr->ud);
+                    }
+
+                    luaL_error(L, "checkValue error, type mismatched, expect %s, but got %s", TypeName<T>::value().c_str(), valueTypeName);
+                }
+
+                luaL_error(L, "checkValue error, type mismatched, expect %s, but got %s", TypeName<T>::value().c_str(), "unknown");
             }
             return *(udptr->ud);
         }
@@ -1032,7 +1075,6 @@ namespace NS_SLUA {
         static void setupMetaTable(lua_State* L,const char* tn,lua_CFunction setupmt,lua_CFunction gc);
         static void setupMetaTable(lua_State* L, const char* tn, lua_CFunction setupmt, int gc);
         static void setupMetaTable(lua_State* L, const char* tn, lua_CFunction gc);
-        static void callRpc(lua_State* L, UObject* obj, UFunction* func, uint8* params);
         static void createTable(lua_State* L, const char* tn);
     };
 
